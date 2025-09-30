@@ -9,7 +9,7 @@ class ConvolutionFIR
 private:
 	std::vector<float> fir;
 	std::vector<float> buffer;
-	int firlen;
+	int firlen = 0;
 public:
 	void SetConvolutionData(float* firdata, int numSamples)
 	{
@@ -44,8 +44,8 @@ public:
 class ConvolutionFFT
 {
 private:
-	int firlen;//卷积核长度，用于计算预计延迟
-	int fftSize;
+	int firlen = 0;//卷积核长度，用于计算预计延迟
+	int fftSize = 0;
 	std::vector<float> firre, firim;
 	std::vector<float> buffer;
 	std::vector<float> outre, outim;
@@ -136,12 +136,81 @@ public:
 	}
 };
 
+class DelayLine
+{
+private:
+	std::vector<float> buffer;
+	int bufsize = 0;
+	int writepos = 0;
+public:
+	void SetDelayTime(float numSamples)
+	{
+		bufsize = numSamples + 1;
+		buffer.resize(bufsize, 0);
+		writepos = 0;
+	};
+	inline float ProcessSample(float x)
+	{
+		buffer[writepos] = x;
+		writepos = (writepos + 1) % bufsize;
+		return buffer[writepos];
+	}
+};
+
+//https://publications.rwth-aachen.de/record/466561/files/466561.pdf?subformat=pdfa
+class LMConvolution1
+{
+private:
+	constexpr static int firlen = 32;//must be power of 2
+	constexpr static int MaxStages = 256;
+	ConvolutionFIR cfir;
+	std::vector<ConvolutionFFT> cffts;
+	std::vector<DelayLine> delays;
+	int numStages = 0;
+public:
+	LMConvolution1()
+	{
+		cffts.resize(MaxStages);//32已经很长了
+		delays.resize(MaxStages);
+	}
+	void SetConvolutionData(float* fir, int numSamples)
+	{
+		numStages = 0;
+		cfir.SetConvolutionData(fir, std::min(numSamples, firlen));
+		if (numSamples <= firlen)return;
+		numSamples -= firlen;
+		for (int i = 0, pos = firlen; i < MaxStages; ++i)
+		{
+			int len = firlen << i;
+			//if (len > 8192)len = 8192;
+			cffts[i].SetConvolutionData(&fir[pos], std::min(numSamples, len));
+			delays[i].SetDelayTime(pos - cffts[i].GetLatencySamples());
+			if (numSamples <= len)
+			{
+				numStages = i + 1;
+				return;
+			}
+			numSamples -= len;
+			pos += len;
+		}
+	}
+	inline float ProcessSample(float x)
+	{
+		float y = cfir.ProcessSample(x);
+		for (int i = 0; i < numStages; i++)
+		{
+			y += cffts[i].ProcessSample(delays[i].ProcessSample(x));
+		}
+		return y;
+	}
+};
+
 class TestConvolution
 {
 public:
-	constexpr static int TestLen = 2048;
+	constexpr static int TestLen = 65536;
 private:
-	ConvolutionFFT cfft;
+	LMConvolution1 convolution;
 	float testdatre[TestLen];
 	float testdatim[TestLen];
 public:
@@ -150,18 +219,21 @@ public:
 		auto randf = []() { return (float)(rand() % 10000) / 10000.0 * (rand() % 2 ? 1 : -1); };
 		for (int i = 0; i < TestLen; i++)
 		{
-			testdatre[i] = randf();
+			float x = (float)(i + 100) / (TestLen + 100);
+			x = x * x;
+			testdatre[i] = sinf(x * 2.0 * M_PI * 10000.0);
 			testdatim[i] = 0;
 		}
 		//testdatre[0] = 1.0;
-		//testdatre[TestLen - 1] = 1.0;
-		cfft.SetConvolutionData(testdatre, TestLen);
+		//testdatre[TestLen / 2] = 1.0;
+		convolution.SetConvolutionData(testdatre, TestLen);
 	}
+	float fbv = 0;
 	void ProcessBlock(const float* in, float* out, int numSamples)
 	{
 		for (int i = 0; i < numSamples; i++)
 		{
-			out[i] = cfft.ProcessSample(in[i]);
+			out[i] = fbv = convolution.ProcessSample(in[i] - fbv * 0.0025);
 		}
 	}
 };
