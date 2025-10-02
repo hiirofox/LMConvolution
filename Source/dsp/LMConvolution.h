@@ -182,7 +182,7 @@ public:
 		for (int i = 0, pos = firlen; i < MaxStages; ++i)
 		{
 			int len = firlen << i;
-			//if (len > 8192)len = 8192;
+			if (len > 16384)len = 16384;
 			cffts[i].SetConvolutionData(&fir[pos], std::min(numSamples, len));
 			delays[i].SetDelayTime(pos - cffts[i].GetLatencySamples());
 			if (numSamples <= len)
@@ -208,7 +208,7 @@ public:
 class TestConvolution
 {
 public:
-	constexpr static int TestLen = 65536;
+	constexpr static int TestLen = 131072 * 2;
 private:
 	LMConvolution1 convolution;
 	float testdatre[TestLen];
@@ -216,16 +216,32 @@ private:
 public:
 	TestConvolution()
 	{
-		auto randf = []() { return (float)(rand() % 10000) / 10000.0 * (rand() % 2 ? 1 : -1); };
-		for (int i = 0; i < TestLen; i++)
+		for (int i = 0; i < TestLen / 2; ++i)
 		{
-			float x = (float)(i + 100) / (TestLen + 100);
-			x = x * x;
-			testdatre[i] = sinf(x * 2.0 * M_PI * 10000.0);
+			float x = (float)i / (TestLen / 2);
+			x = x * x * TestLen / 4;
+			testdatre[i] = cosf(x * 2.0 * M_PI);
+			testdatim[i] = -sinf(x * 2.0 * M_PI);
+		}
+		for (int i = 0; i < 10; ++i)
+		{
+			float x = i / 10;
+			x = expf(x * 8.0 - 8.0);
+			testdatre[i] *= x;
+			testdatim[i] *= x;
+		}
+
+		for (int i = TestLen / 2; i < TestLen; ++i)
+		{
+			testdatre[i] = 0;
 			testdatim[i] = 0;
 		}
-		//testdatre[0] = 1.0;
-		//testdatre[TestLen / 2] = 1.0;
+		fft_f32(testdatre, testdatim, TestLen, 1);
+		for (int i = 0; i < TestLen; ++i)
+		{
+			testdatre[i] /= TestLen / 2;
+			testdatim[i] /= TestLen / 2;
+		}
 		convolution.SetConvolutionData(testdatre, TestLen);
 	}
 	float fbv = 0;
@@ -233,7 +249,7 @@ public:
 	{
 		for (int i = 0; i < numSamples; i++)
 		{
-			out[i] = fbv = convolution.ProcessSample(in[i] - fbv * 0.0025);
+			out[i] = fbv = convolution.ProcessSample(in[i] - fbv * 0.90);
 		}
 	}
 };
