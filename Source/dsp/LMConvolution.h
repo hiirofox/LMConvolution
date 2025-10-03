@@ -158,7 +158,7 @@ public:
 };
 
 //https://publications.rwth-aachen.de/record/466561/files/466561.pdf?subformat=pdfa
-class LMConvolution1
+class LMConvolution1//优势:零延迟，非均匀切分ir
 {
 private:
 	constexpr static int firlen = 32;//must be power of 2
@@ -170,7 +170,7 @@ private:
 public:
 	LMConvolution1()
 	{
-		cffts.resize(MaxStages);//32已经很长了
+		cffts.resize(MaxStages);
 		delays.resize(MaxStages);
 	}
 	void SetConvolutionData(float* fir, int numSamples)
@@ -203,14 +203,181 @@ public:
 		}
 		return y;
 	}
+	inline int GetLatencySamples()
+	{
+		return 0;
+	}
+};
+class LMConvolution2//优势:更新一次只需一次fft和ifft。延迟为块长度
+{
+private:
+	std::vector<std::vector<std::complex<float>>> firs;
+	std::vector<std::vector<std::complex<float>>> bufs;
+	std::vector<float> blockbuf;
+	std::vector<std::complex<float>> blockbuf_fft;  // 输入FFT专用
+	std::vector<std::complex<float>> output_buf;    // 输出专用
+	int posIn = 0, posHop = 0;
+	int bufIndex = 0;  // 用于循环缓冲区索引，避免移位
+	int numStages = 0;
+	int blockSize = 4096;
+
+public:
+	LMConvolution2() {}
+
+	void SetConvolutionData(float* fir, int numSamples, int blockSize = 4096)
+	{
+		this->blockSize = blockSize;
+		blockbuf.resize(blockSize * 2, 0);
+		blockbuf_fft.resize(blockSize * 2, { 0, 0 });
+		output_buf.resize(blockSize * 2, { 0, 0 });
+
+		firs.clear();
+		bufs.clear();
+		numStages = 0;
+		bufIndex = 0;
+
+		std::vector<std::complex<float>> tmp;
+		int pos = 0;
+
+		for (; pos < numSamples - blockSize; pos += blockSize, numStages++)
+		{
+			tmp.assign(blockSize * 2, { 0, 0 });
+			for (int i = 0; i < blockSize; ++i)
+			{
+				tmp[i] = fir[i + pos];
+			}
+			fft_f32(tmp, blockSize * 2, 1);
+			firs.push_back(tmp);
+
+			// 预分配缓冲区
+			bufs.push_back(std::vector<std::complex<float>>(blockSize * 2, { 0, 0 }));
+		}
+
+		if (numSamples - pos >= 1)
+		{
+			tmp.assign(blockSize * 2, { 0, 0 });
+			for (int i = 0; i < numSamples - pos; ++i)
+			{
+				tmp[i] = fir[i + pos];
+			}
+			fft_f32(tmp, blockSize * 2, 1);
+			firs.push_back(tmp);
+			bufs.push_back(std::vector<std::complex<float>>(blockSize * 2, { 0, 0 }));
+			numStages++;
+		}
+	}
+
+	inline float ProcessSample(float x)
+	{
+		blockbuf[posIn] = x;
+		posIn++;
+		posHop++;
+		if (posIn >= blockSize * 2) posIn = 0;
+
+		if (posHop >= blockSize)
+		{
+			posHop = 0;
+
+			// 复制输入块到FFT缓冲区
+			if (posIn == 0)
+			{
+				for (int i = 0; i < blockSize * 2; i++)
+					blockbuf_fft[i] = blockbuf[i];
+			}
+			else
+			{
+				for (int i = 0; i < blockSize; i++)
+					blockbuf_fft[i] = blockbuf[i + blockSize];
+				for (int i = 0; i < blockSize; i++)
+					blockbuf_fft[i + blockSize] = blockbuf[i];
+			}
+
+			fft_f32(blockbuf_fft, blockSize * 2, 1);
+
+			// 使用循环索引，避免移位
+			bufIndex = (bufIndex - 1 + numStages) % numStages;
+			bufs[bufIndex] = blockbuf_fft;
+
+			// 累加卷积结果
+			std::fill(output_buf.begin(), output_buf.end(), std::complex<float>(0, 0));
+			for (int n = 0; n < numStages; ++n)
+			{
+				int idx = (bufIndex + n) % numStages;
+				for (int i = 0; i < blockSize * 2; ++i)
+				{
+					output_buf[i] += firs[n][i] * bufs[idx][i];
+				}
+			}
+
+			fft_f32(output_buf, blockSize * 2, -1);
+		}
+
+		// 从输出缓冲区读取，跳过前半部分(overlap)
+		return output_buf[posHop + blockSize].real() / (blockSize * 2);
+	}
+
+	inline int GetLatencySamples()
+	{
+		return blockSize;
+	}
 };
 
+class LMConvolution3//优势:结合1 2
+{
+private:
+	constexpr static int firlen = 64;//must be power of 2
+	constexpr static int MaxStages = 256;
+	ConvolutionFIR cfir;
+	std::vector<LMConvolution2> cffts;
+	std::vector<DelayLine> delays;
+	int numStages = 0;
+public:
+	LMConvolution3()
+	{
+		cffts.resize(MaxStages);
+		delays.resize(MaxStages);
+	}
+	void SetConvolutionData(float* fir, int numSamples)
+	{
+		numStages = 0;
+		cfir.SetConvolutionData(fir, std::min(numSamples, firlen));
+		if (numSamples <= firlen)return;
+		numSamples -= firlen;
+		for (int i = 0, pos = firlen; i < MaxStages; ++i)
+		{
+			int len = firlen << i;
+			//if (len > 16384)len = 16384;
+			cffts[i].SetConvolutionData(&fir[pos], std::min(numSamples, len), len / 32);
+			delays[i].SetDelayTime(pos - cffts[i].GetLatencySamples());
+			if (numSamples <= len)
+			{
+				numStages = i + 1;
+				return;
+			}
+			numSamples -= len;
+			pos += len;
+		}
+	}
+	inline float ProcessSample(float x)
+	{
+		float y = cfir.ProcessSample(x);
+		for (int i = 0; i < numStages; i++)
+		{
+			y += cffts[i].ProcessSample(delays[i].ProcessSample(x));
+		}
+		return y;
+	}
+	inline int GetLatencySamples()
+	{
+		return 0;
+	}
+};
 class TestConvolution
 {
 public:
 	constexpr static int TestLen = 131072 * 2;
 private:
-	LMConvolution1 convolution;
+	LMConvolution3 convolution;
 	float testdatre[TestLen];
 	float testdatim[TestLen];
 public:

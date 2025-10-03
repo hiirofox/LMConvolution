@@ -106,3 +106,40 @@ void fft_f32(float* are, float* aim, int n, int inv)
 		}
 	}
 }
+
+void fft_f32(std::vector<std::complex<float>>& a, int n, int inv)
+{
+	for (int i = 1, j = 0; i < n - 1; ++i)
+	{
+		for (int s = n; j ^= s >>= 1, ~j & s;)
+			;
+		if (i < j)
+		{
+			std::complex<float> tmp = a[i];
+			a[i] = a[j];
+			a[j] = tmp;
+		}
+	}
+	int p1, p2;
+	for (int m = 2; m <= n; m <<= 1)
+	{
+		std::complex<float> wm{ cosf(2.0f * M_PI / m),sinf(2.0f * M_PI / m) * inv };
+		for (int k = 0; k < n; k += m)
+		{
+			std::complex<float> w{ 1.0,0.0 };
+			p1 = m >> 1;
+			for (int j = 0; j < p1; ++j)
+			{
+				p2 = k + j;
+				// 计算 t = w * a[p2 + p1]
+				std::complex<float>t = w * a[p2 + p1];
+				// 更新 a[p2] 和 a[p2 + p1]
+				a[p2 + p1] = a[p2] - t;
+				a[p2] += t;
+				// 更新 w = w * wm
+				t = w * wm;
+				w = t;
+			}
+		}
+	}
+}
