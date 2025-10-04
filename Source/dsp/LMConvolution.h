@@ -334,6 +334,8 @@ public:
 	}
 
 };
+
+
 class LMConvolution2Async
 {
 private:
@@ -341,23 +343,20 @@ private:
 	std::thread process_thread;
 	std::atomic_bool should_stop{ false };
 
-	// 无锁三缓冲区系统
+	// 双缓冲结构
 	struct BufferSlot {
-		std::vector<float> data;
-		std::atomic<int> state{ 0 }; // 0=空闲, 1=填充中, 2=待处理, 3=处理中
+		std::vector<float> input;
+		std::vector<float> output;
+		std::atomic<int> state{ 0 };  // 0=空闲, 1=已填充待处理, 2=处理完成可输出
 	};
 
-	BufferSlot buffers[3];
-	std::atomic<int> current_fill{ 0 };    // 主线程当前填充的槽
-	std::atomic<int> current_process{ -1 }; // 工作线程当前处理的槽
-	std::atomic<int> current_output{ -1 };  // 主线程当前输出的槽
+	BufferSlot buffers[2];
+
+	int fill_buffer = 0;      // 主线程当前填充的buffer
+	int output_buffer = -1;   // 主线程当前输出的buffer
 
 	int fill_pos = 0;
-	int output_pos = 0;
-	int block_size = 0;
-
-	// 延迟补偿：预填充一块数据
-	bool first_block_done = false;
+	int half_block_size = 0;  // 实际使用的块大小（用户指定的一半）
 
 public:
 	~LMConvolution2Async()
@@ -368,61 +367,56 @@ public:
 		}
 	}
 
-	void SetConvolutionData(float* fir, int numSamples, int blockSize = 4096)
+	void SetConvolutionData(float* fir, int numSamples, int blockSize = 32768)
 	{
-		// 停止旧线程
 		should_stop.store(true);
 		if (process_thread.joinable()) {
 			process_thread.join();
 		}
 
-		block_size = blockSize;
+		// 关键：使用 blockSize/2 作为实际块大小
+		half_block_size = blockSize / 2;
 
-		// 初始化卷积核心
-		conv.SetConvolutionData(fir, numSamples, block_size);
+		// 卷积核心也使用 blockSize/2
+		conv.SetConvolutionData(fir, numSamples, half_block_size);
 
-		// 初始化三个缓冲槽
-		for (int i = 0; i < 3; ++i) {
-			buffers[i].data.assign(block_size, 0);
+		// 初始化双缓冲
+		for (int i = 0; i < 2; ++i) {
+			buffers[i].input.assign(half_block_size, 0);
+			buffers[i].output.assign(half_block_size, 0);
 			buffers[i].state.store(0);
 		}
 
+		fill_buffer = 0;
+		output_buffer = -1;
 		fill_pos = 0;
-		output_pos = 0;
-		first_block_done = false;
-		current_fill.store(0);
-		current_process.store(-1);
-		current_output.store(-1);
 		should_stop.store(false);
 
-		// 启动工作线程
+		// 启动处理线程
 		process_thread = std::thread([this]() {
 			while (!should_stop.load(std::memory_order_relaxed)) {
 				bool processed = false;
 
-				// 查找待处理的槽
-				for (int i = 0; i < 3; ++i) {
-					int expected = 2; // 待处理状态
+				// 查找待处理的buffer
+				for (int i = 0; i < 2; ++i) {
+					int expected = 1;
 					if (buffers[i].state.compare_exchange_strong(
-						expected, 3, std::memory_order_acquire)) {
+						expected, 2, std::memory_order_acquire)) {
 
-						// 处理这个槽
-						current_process.store(i, std::memory_order_release);
-
-						for (int j = 0; j < block_size; ++j) {
-							buffers[i].data[j] = conv.ProcessSample(buffers[i].data[j]);
+						// 处理整个块
+						for (int j = 0; j < half_block_size; ++j) {
+							buffers[i].output[j] = conv.ProcessSample(buffers[i].input[j]);
 						}
 
-						// 标记为已完成（可输出）
-						buffers[i].state.store(4, std::memory_order_release);
+						// 保持 state=2，等待主线程使用
 						processed = true;
 						break;
 					}
 				}
 
 				if (!processed) {
-					// 没有待处理数据，短暂休眠
-					std::this_thread::yield();
+					//std::this_thread::yield();
+					std::this_thread::sleep_for(std::chrono::microseconds(1));
 				}
 			}
 			});
@@ -430,71 +424,50 @@ public:
 
 	inline float ProcessSample(float x)
 	{
-		int fill_slot = current_fill.load(std::memory_order_relaxed);
+		// 填充当前buffer
+		buffers[fill_buffer].input[fill_pos] = x;
 
-		// 填充当前槽
-		buffers[fill_slot].data[fill_pos] = x;
-
-		// 从输出槽读取数据
+		// 从输出buffer读取
 		float y = 0.0f;
-		int output_slot = current_output.load(std::memory_order_acquire);
-
-		if (output_slot >= 0) {
-			// 有可用输出
-			y = buffers[output_slot].data[output_pos];
-			output_pos++;
-
-			// 输出块完成
-			if (output_pos >= block_size) {
-				output_pos = 0;
-				// 释放输出槽
-				buffers[output_slot].state.store(0, std::memory_order_release);
-				current_output.store(-1, std::memory_order_release);
-			}
+		if (output_buffer >= 0) {
+			y = buffers[output_buffer].output[fill_pos];
 		}
 
 		fill_pos++;
 
-		// 填充块完成
-		if (fill_pos >= block_size) {
+		// 半块填充完成
+		if (fill_pos >= half_block_size) {
 			fill_pos = 0;
 
-			// 标记当前槽为待处理
-			buffers[fill_slot].state.store(2, std::memory_order_release);
+			// 标记当前填充buffer为待处理
+			buffers[fill_buffer].state.store(1, std::memory_order_release);
 
-			// 如果这是第一块，不要立即输出（保持blockSize延迟）
-			if (!first_block_done) {
-				first_block_done = true;
-			}
-			else {
-				// 等待有已完成的槽可以输出
-				for (int attempts = 0; attempts < 1000; ++attempts) {
-					for (int i = 0; i < 3; ++i) {
-						int expected = 4; // 已完成状态
-						if (buffers[i].state.compare_exchange_strong(
-							expected, 5, std::memory_order_acquire)) {
-							current_output.store(i, std::memory_order_release);
-							goto found_output;
-						}
-					}
-					std::this_thread::yield();
+			// 切换到另一个buffer
+			int next_fill = 1 - fill_buffer;
+
+			// 等待下一个buffer准备好（状态为0或2）
+			while (true) {
+				int expected = 2;  // 先尝试处理完成状态
+				if (buffers[next_fill].state.compare_exchange_strong(
+					expected, 0, std::memory_order_acquire)) {
+					// 处理完成的buffer，设为输出，并释放
+					output_buffer = fill_buffer;
+					break;
 				}
-			found_output:;
+
+				expected = 0;  // 再尝试空闲状态（第一次循环时）
+				if (buffers[next_fill].state.compare_exchange_strong(
+					expected, 0, std::memory_order_acquire)) {
+					// 空闲buffer，不更新输出（第一次迭代）
+					break;
+				}
+
+				// 都失败了，说明buffer还在处理中，等待
+				//std::this_thread::yield();
+				std::this_thread::sleep_for(std::chrono::microseconds(1));
 			}
 
-			// 查找下一个空闲槽用于填充
-			for (int attempts = 0; attempts < 1000; ++attempts) {
-				for (int i = 0; i < 3; ++i) {
-					int expected = 0; // 空闲状态
-					if (buffers[i].state.compare_exchange_strong(
-						expected, 1, std::memory_order_acquire)) {
-						current_fill.store(i, std::memory_order_release);
-						goto found_fill;
-					}
-				}
-				std::this_thread::yield();
-			}
-		found_fill:;
+			fill_buffer = next_fill;
 		}
 
 		return y;
@@ -502,25 +475,31 @@ public:
 
 	inline int GetLatencySamples()
 	{
-		return block_size;
+		// 总延迟 = half_block_size（卷积延迟） + half_block_size（缓冲延迟）
+		return half_block_size * 2;
 	}
 };
 
 class LMConvolution3 :public ConvolutionBase//优势:结合1 2
 {
 private:
-	constexpr static int firlen = 32;//must be power of 2
+	constexpr static int firlen = 256;//must be power of 2
 	constexpr static int MaxStages = 256;
 	ConvolutionFIR cfir;
-	std::vector<LMConvolution2Async> cffts;
+	std::vector<std::unique_ptr<LMConvolution2Async>> cffts;
 	std::vector<DelayLine> delays;
 	int numStages = 0;
 public:
 	LMConvolution3()
 	{
-		cffts.resize(MaxStages);
+		cffts.reserve(MaxStages);  // 预留空间，避免重新分配
+		for (int i = 0; i < MaxStages; ++i)
+		{
+			cffts.push_back(std::make_unique<LMConvolution2Async>());
+		}
 		delays.resize(MaxStages);
 	}
+
 	void SetConvolutionData(float* fir, int numSamples)
 	{
 		numStages = 0;
@@ -531,8 +510,8 @@ public:
 		{
 			int len = firlen << i;
 			//if (len > 16384)len = 16384;
-			cffts[i].SetConvolutionData(&fir[pos], std::min(numSamples, len), len);
-			delays[i].SetDelayTime(pos - cffts[i].GetLatencySamples());
+			cffts[i]->SetConvolutionData(&fir[pos], std::min(numSamples, len), len / 2);
+			delays[i].SetDelayTime(pos - cffts[i]->GetLatencySamples());
 			if (numSamples <= len)
 			{
 				numStages = i + 1;
@@ -542,29 +521,98 @@ public:
 			pos += len;
 		}
 	}
+
 	inline float ProcessSample(float x)
 	{
 		float y = cfir.ProcessSample(x);
 		for (int i = 0; i < numStages; i++)
 		{
-			y += cffts[i].ProcessSample(delays[i].ProcessSample(x));
+			y += cffts[i]->ProcessSample(delays[i].ProcessSample(x));
 		}
 		return y;
 	}
+
 	inline int GetLatencySamples()
 	{
 		return 0;
 	}
-
 };
 
+class LMConvolution4
+{
+private:
+	constexpr static int firlen = 32;//must be power of 2
+	constexpr static int MaxStages = 256;
+	ConvolutionFIR cfir;
+	std::vector<std::unique_ptr<LMConvolution2>> cffts;
+	std::vector<std::unique_ptr<LMConvolution2Async>> cfftAsyncs;//块长度大于某值时开始使用
+	std::vector<DelayLine> delays;
+	int numStages = 0, numAsyncStages = 0;
+	constexpr static int MinAsyncBlockSize = 2048;
+public:
+	LMConvolution4()
+	{
+		cffts.reserve(MaxStages);  // 预留空间，避免重新分配
+		for (int i = 0; i < MaxStages; ++i)
+		{
+			cffts.push_back(std::make_unique<LMConvolution2>());
+			cfftAsyncs.push_back(std::make_unique<LMConvolution2Async>());
+		}
+		delays.resize(MaxStages);
+	}
+	void SetConvolutionData(float* fir, int numSamples)
+	{
+		numStages = 0;
+		numAsyncStages = 0;
+		cfir.SetConvolutionData(fir, std::min(numSamples, firlen));
+		if (numSamples <= firlen)return;
+		numSamples -= firlen;
+		for (int i = 0, pos = firlen; i < MaxStages; ++i)
+		{
+			int len = firlen << i;
+			//if (len > 16384)len = 16384;
+			if (len >= MinAsyncBlockSize)
+			{
+				cfftAsyncs[numAsyncStages]->SetConvolutionData(&fir[pos], std::min(numSamples, len), len);
+				delays[numStages].SetDelayTime(pos - cfftAsyncs[numAsyncStages]->GetLatencySamples());
+				numAsyncStages++;
+			}
+			else
+			{
+				cffts[numStages]->SetConvolutionData(&fir[pos], std::min(numSamples, len), len);
+				delays[numStages].SetDelayTime(pos - cffts[numStages]->GetLatencySamples());
+				numStages++;
+			}
+			if (numSamples <= len)
+			{
+				return;
+			}
+			numSamples -= len;
+			pos += len;
+		}
+	}
+
+	inline float ProcessSample(float x)
+	{
+		float y = cfir.ProcessSample(x);
+		for (int i = 0; i < numStages; i++)
+		{
+			y += cffts[i]->ProcessSample(x);
+		}
+		for (int i = 0; i < numAsyncStages; i++)
+		{
+			y += cfftAsyncs[i]->ProcessSample(x);
+		}
+		return y;
+	}
+};
 
 class TestConvolution
 {
 public:
-	constexpr static int TestLen = 65536 * 32;
+	constexpr static int TestLen = 65536 * 512;
 private:
-	LMConvolution3 convolution;
+	LMConvolution4 convolution;
 	float testdatre[TestLen];
 	float testdatim[TestLen];
 public:
@@ -603,7 +651,7 @@ public:
 	{
 		for (int i = 0; i < numSamples; i++)
 		{
-			out[i] = fbv = convolution.ProcessSample(in[i] - fbv * 0.90);
+			out[i] = fbv = convolution.ProcessSample(in[i] - fbv * 0.00);
 		}
 	}
 };
